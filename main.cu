@@ -1,7 +1,9 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <thrust/reduce.h>
+#include <thrust/sort.h>
 #include <thrust/execution_policy.h>
+#include <thrust/iterator/constant_iterator.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <float.h>
@@ -11,10 +13,10 @@
 
 float getRandWithRange(float min, float max);
 cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, int K, int dim_number, float threshold);
-void kMeansCPU(float *objects, float *clusters, int K, int N, int dim_number, float threshold);
+void kMeansCPU(float *objects, float *clusters, int *membership, int K, int N, int dim_number, float threshold);
 float *file_read(char *filename, int *N, int *dim_number, float **minInDim, float **maxInDim);
 int file_write(char *filename, int K, int N, int dim_number, float *clusters, int *membership);
-__host__ __device__ float distance_without_sqrt(float *x, float *y, int dim_number);
+__host__ __device__ float distance_without_sqrt(float *object, float *cluster, int dim_number, int object_i, int cluster_i, int N, int K);
 
 __global__ void kernel(float *objects, float *clusters, int *membership, int *delta, int N, int K, int dim_number)
 {
@@ -23,10 +25,10 @@ __global__ void kernel(float *objects, float *clusters, int *membership, int *de
     if (i < N)
     {
         int index = 0;
-        int dmin = distance_without_sqrt(objects + dim_number * i, clusters, dim_number);
+        float dmin = distance_without_sqrt(objects, clusters, dim_number, i, 0, N, K);
         for (int j = 0; j < K; j++)
         {
-            int distance = distance_without_sqrt(objects + dim_number * i, clusters + dim_number * j, dim_number);
+            float distance = distance_without_sqrt(objects, clusters, dim_number, i, j, N, K);
             if (distance < dmin)
             {
                 dmin = distance;
@@ -42,31 +44,25 @@ __global__ void kernel(float *objects, float *clusters, int *membership, int *de
     }
 }
 
-__global__ void kernel2(int *new_cluster_size, float *clusters, float *new_clusters, int *membership, int N, int K, int dim_number)
+__global__ void kernel2(int *new_cluster_size, float *clusters, float *new_clusters, int *keys, int K, int dim_number)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (i < K)
     {
-        // int new_cluster_size = 0;
-        // for (int j = 0; j < N; j++)
-        // {
-        //     if (membership[j] == i)
-        //     {
-        //         new_cluster_size++;
-        //         for (int k = 0; k < dim_number; k++)
-        //         {
-        //             new_clusters[i * dim_number + k] += objects[j * dim_number + k];
-        //         }
-        //     }
-        // }
-
-        for (int j = 0; j < dim_number; j++)
+        int index = keys[i];
+        if (index == -1)
+            return;
+        if (new_cluster_size[index] != 0)
         {
-            clusters[i * dim_number + j] = new_clusters[i * dim_number + j] / new_cluster_size[i];
-            new_clusters[i * dim_number + j] = 0;
+            for (int j = 0; j < dim_number; j++)
+            {
+                clusters[index + j * K] = new_clusters[index + j * K] / new_cluster_size[index];
+                new_clusters[index + j * K] = 0;
+                keys[i + j * K] = -1;
+            }
+            new_cluster_size[index] = 0;
         }
-        new_cluster_size[i] = 0;
     }
 }
 
@@ -77,38 +73,11 @@ __global__ void kernel3(float *new_clusters, float *objects, int *membership, in
     {
         for (int j = 0; j < dim_number; j++)
         {
-            atomicAdd(&new_clusters[membership[i]], objects[i * dim_number + j]);
+            atomicAdd(&new_clusters[membership[i] + j * dim_number], objects[i + j * N]); // dim_number zamień na K
             atomicAdd(&new_cluster_size[i], 1);
         }
     }
 }
-
-// __global__ void reduce(int N, int *key, float *out)
-// {
-//     int i = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (i < N)
-//     {
-//         int li = ti % warpSize;
-
-//         // code which computes a value per thread to be reduced,
-//         // for threads where key[i] == -1, val = 0.f
-//         float val = 123.45f;
-
-//         // reset out to zero ready for atomic addition later
-//         if (li == 0)
-//             out[key[i]] = 0.f;
-//         __syncthreads();
-
-//         // warp reduction
-//         int offset = 0;
-//         for (offset = warpSize / 2; offset > 0; offset /= 2)
-//             val += __shfl_down(val, offset);
-
-//         // atomically update out with each warp's result
-//         if (li == 0)
-//             atomicAdd(&out[key[i]], val);
-//     }
-// }
 
 int main(int argc, char **argv)
 {
@@ -119,7 +88,7 @@ int main(int argc, char **argv)
 
     int N, dim_number;
     float *minInDim, *maxInDim;
-    float threshold = 0.001;
+    float threshold = 0.0001;
     float *objects = file_read(filename, &N, &dim_number, &minInDim, &maxInDim);
 
     srand(time(0));
@@ -129,14 +98,15 @@ int main(int argc, char **argv)
     {
         for (int j = 0; j < dim_number; j++)
         {
-            clusters[i * dim_number + j] = getRandWithRange(minInDim[j], maxInDim[j]);
+            clusters[i + j * K] = getRandWithRange(minInDim[j], maxInDim[j]);
         }
     }
     int *membership = (int *)malloc(N * sizeof(int));
     assert(membership != NULL);
+    memset(membership, 0, N);
 
     // printf("I'm starting counting on CPU\n");
-    // kMeansCPU(objects, clusters, K, N, dim_number, threshold);
+    // kMeansCPU(objects, clusters, membership, K, N, dim_number, threshold);
 
     printf("I'm starting counting on GPU\n");
     cudaError_t cudaStatus = kMeansCUDA(objects, clusters, membership, N, K, dim_number, threshold);
@@ -145,7 +115,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "kMeansCuda failed!\n");
         return 1;
     }
-
     file_write(filename, K, N, dim_number, clusters, membership);
 
     // cudaDeviceReset must be called before exiting in order for profiling and
@@ -167,14 +136,15 @@ int main(int argc, char **argv)
 
 cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, int K, int dim_number, float threshold)
 {
-    float *dev_objects, *dev_clusters, *dev_newclusters;
-    int *dev_membership, *dev_delta, *dev_newclustersize, *dev_fake, *dev_membershipToReduce;
+    float *dev_objects, *dev_clusters, *dev_newclusters, *dev_objectsToSort;
+    int *dev_membership, *dev_delta, *dev_newclustersize, *dev_fake, *dev_membershipToSort, *dev_keys, *keys;
     int numberOfBlocks = (N - 1) / 1024 + 1, loop = 0, numberOfBlocks2 = (K - 1) / 1024 + 1, i;
+    keys = (int *)malloc(K * dim_number * sizeof(int));
     cudaError_t cudaStatus;
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    float time, deltaSum = 1000000;
+    float time, deltaSum;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
     cudaStatus = cudaSetDevice(0);
@@ -196,6 +166,14 @@ cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, 
     if (cudaStatus != cudaSuccess)
     {
         fprintf(stderr, "cudaMemcpy failed!\n");
+        goto Error;
+    }
+
+    // dev_objects
+    cudaStatus = cudaMalloc((void **)&dev_objectsToSort, N * dim_number * sizeof(float));
+    if (cudaStatus != cudaSuccess)
+    {
+        fprintf(stderr, "cudaMalloc failed!\n");
         goto Error;
     }
 
@@ -237,25 +215,18 @@ cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, 
         goto Error;
     }
 
-    cudaStatus = cudaMemset(dev_membership, 0, N * sizeof(int));
+    cudaStatus = cudaMemset(dev_membership, -1, N * sizeof(int));
     if (cudaStatus != cudaSuccess)
     {
         fprintf(stderr, "cudaMemset failed!\n");
         goto Error;
     }
 
-    // dev_membershipToReduce
-    cudaStatus = cudaMalloc((void **)&dev_membershipToReduce, N * sizeof(int));
+    // dev_membershipToSort
+    cudaStatus = cudaMalloc((void **)&dev_membershipToSort, N * sizeof(int));
     if (cudaStatus != cudaSuccess)
     {
         fprintf(stderr, "cudaMalloc failed!\n");
-        goto Error;
-    }
-
-    cudaStatus = cudaMemset(dev_membershipToReduce, 0, N * sizeof(int));
-    if (cudaStatus != cudaSuccess)
-    {
-        fprintf(stderr, "cudaMemset failed!\n");
         goto Error;
     }
 
@@ -282,15 +253,15 @@ cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, 
         goto Error;
     }
 
-    // dev_fake
-    cudaStatus = cudaMalloc((void **)&dev_fake, N * sizeof(int));
+    // dev_keys
+    cudaStatus = cudaMalloc((void **)&dev_keys, K * dim_number * sizeof(int));
     if (cudaStatus != cudaSuccess)
     {
         fprintf(stderr, "cudaMalloc failed!\n");
         goto Error;
     }
 
-    cudaStatus = cudaMemset(dev_fake, 1, N * sizeof(int));
+    cudaStatus = cudaMemset(dev_keys, -1, K * dim_number * sizeof(int));
     if (cudaStatus != cudaSuccess)
     {
         fprintf(stderr, "cudaMemset failed!\n");
@@ -315,13 +286,38 @@ cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, 
             goto Error;
         }
         // kernel3<<<numberOfBlocks, 1024>>>(dev_newclusters, dev_objects, dev_membership, dev_newclustersize, N, dim_number);
+
+        cudaStatus = cudaMemcpy(dev_objectsToSort, dev_objects, N * dim_number * sizeof(float), cudaMemcpyDeviceToDevice);
+        if (cudaStatus != cudaSuccess)
+        {
+            fprintf(stderr, "cudaMemcpy failed!\n");
+            goto Error;
+        }
+
         for (i = 0; i < dim_number; i++)
         {
-            thrust::reduce_by_key(thrust::device, dev_clusters + N * i, dev_clusters + N * (i + 1), dev_membership, NULL, dev_newclusters);
-        }
-        thrust::reduce_by_key(thrust::device, dev_fake, dev_fake + N, dev_membership, NULL, dev_newclustersize);
+            cudaStatus = cudaMemcpy(dev_membershipToSort, dev_membership, N * sizeof(int), cudaMemcpyDeviceToDevice);
+            if (cudaStatus != cudaSuccess)
+            {
+                fprintf(stderr, "cudaMemcpy failed!\n");
+                goto Error;
+            }
 
-        kernel2<<<numberOfBlocks2, 1024>>>(dev_newclustersize, dev_clusters, dev_newclusters, dev_membership, N, K, dim_number);
+            thrust::sort_by_key(thrust::device, dev_membershipToSort, dev_membershipToSort + N, dev_objectsToSort + N * i);
+            thrust::reduce_by_key(thrust::device, dev_membershipToSort, dev_membershipToSort + N, dev_objectsToSort + N * i, dev_keys + K * i, dev_newclusters + K * i);
+        }
+
+        cudaStatus = cudaMemcpy(dev_membershipToSort, dev_membership, N * sizeof(int), cudaMemcpyDeviceToDevice);
+        if (cudaStatus != cudaSuccess)
+        {
+            fprintf(stderr, "cudaMemcpy failed!\n");
+            goto Error;
+        }
+
+        thrust::sort(thrust::device, dev_membershipToSort, dev_membershipToSort + N);
+        thrust::reduce_by_key(thrust::device, dev_membershipToSort, dev_membershipToSort + N, thrust::make_constant_iterator(1), dev_keys, dev_newclustersize);
+
+        kernel2<<<numberOfBlocks2, 1024>>>(dev_newclustersize, dev_clusters, dev_newclusters, dev_keys, K, dim_number);
         cudaStatus = cudaGetLastError();
         if (cudaStatus != cudaSuccess)
         {
@@ -330,7 +326,7 @@ cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, 
         }
 
         deltaSum = thrust::reduce(thrust::device, dev_delta, dev_delta + N, (float)0);
-        printf("loop nr %d\n", loop);
+        printf("loop nr %d, deltaSum: %f\n", loop, deltaSum);
     } while (deltaSum / N > threshold && loop++ < 500);
 
     // Check for any errors launching the kernel
@@ -349,6 +345,13 @@ cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
+    cudaStatus = cudaMemcpy(keys, dev_keys, K * dim_number * sizeof(int), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess)
+    {
+        fprintf(stderr, "cudaMemcpy failed!\n");
+        goto Error;
+    }
+    
     // cudaDeviceSynchronize waits for the kernel to finish, and returns
     // any errors encountered during the launch.
     cudaStatus = cudaDeviceSynchronize();
@@ -373,9 +376,15 @@ cudaError_t kMeansCUDA(float *objects, float *clusters, int *membership, int N, 
     }
 Error:
     cudaFree(dev_objects);
+    cudaFree(dev_objectsToSort);
     cudaFree(dev_clusters);
     cudaFree(dev_newclusters);
     cudaFree(dev_membership);
+    cudaFree(dev_membershipToSort);
+    cudaFree(dev_keys);
+    cudaFree(dev_fake);
+    cudaFree(dev_delta);
+    cudaFree(dev_newclustersize);
 
     return cudaStatus;
 }
@@ -387,13 +396,9 @@ float getRandWithRange(float min, float max)
 }
 
 // N - number of objects, K - number of clusters
-void kMeansCPU(float *objects, float *clusters, int K, int N, int dim_number, float threshold)
+void kMeansCPU(float *objects, float *clusters, int *membership, int K, int N, int dim_number, float threshold)
 {
-    int delta, index, dmin, loop = 0;
-
-    int *membership = (int *)malloc(N * sizeof(int));
-    assert(membership != NULL);
-    memset(membership, 0, N);
+    int delta, index, loop = 0;
 
     float *new_clusters = (float *)malloc(K * dim_number * sizeof(float));
     assert(new_clusters != NULL);
@@ -409,10 +414,10 @@ void kMeansCPU(float *objects, float *clusters, int K, int N, int dim_number, fl
         for (int i = 0; i < N; i++)
         {
             index = 0;
-            dmin = distance_without_sqrt(objects + dim_number * i, clusters, dim_number);
+            float dmin = distance_without_sqrt(objects, clusters, dim_number, i, 0, N, K);
             for (int j = 0; j < K; j++)
             {
-                int distance = distance_without_sqrt(objects + dim_number * i, clusters + dim_number * j, dim_number);
+                float distance = distance_without_sqrt(objects, clusters, dim_number, i, j, N, K);
                 if (distance < dmin)
                 {
                     dmin = distance;
@@ -429,24 +434,40 @@ void kMeansCPU(float *objects, float *clusters, int K, int N, int dim_number, fl
             new_cluster_size[index]++;
             for (int j = 0; j < dim_number; j++)
             {
-                new_clusters[index * dim_number + j] += objects[i * N + j];
+                new_clusters[index + j * K] += objects[i + j * N];
             }
         }
 
         for (int i = 0; i < K; i++)
         {
-            for (int j = 0; j < dim_number; j++)
+            if (new_cluster_size[i] != 0)
             {
-                clusters[i * dim_number + j] = new_clusters[i * dim_number + j] / new_cluster_size[i];
-                new_clusters[i * dim_number + j] = 0;
+                for (int j = 0; j < dim_number; j++)
+                {
+                    clusters[i + j * K] = new_clusters[i + j * K] / new_cluster_size[i];
+                    new_clusters[i + j * K] = 0;
+                }
+                new_cluster_size[i] = 0;
             }
-            new_cluster_size[i] = 0;
         }
-    } while (delta / N > threshold && loop++ < 500);
 
-    free(membership);
+        printf("loop nr %d\n", loop);
+    } while ((float)delta / N > threshold && loop++ < 500);
+
     free(new_clusters);
     free(new_cluster_size);
+}
+
+float distance_without_sqrt(float *object, float *cluster, int dim_number, int object_i, int cluster_i, int N, int K)
+{
+    float result = 0.0;
+
+    for (int i = 0; i < dim_number; i++)
+    {
+        result += (object[object_i + i * N] - cluster[cluster_i + i * K]) * (object[object_i + i * N] - cluster[cluster_i + i * K]);
+    }
+
+    return result;
 }
 
 float *file_read(char *filename, int *N, int *dim_number, float **minInDim, float **maxInDim)
@@ -528,7 +549,7 @@ float *file_read(char *filename, int *N, int *dim_number, float **minInDim, floa
         for (j = 0; j < (*dim_number); j++)
         {
             float value = atof(strtok(NULL, delim));
-            objects[i * (*dim_number) + j] = value;
+            objects[i + j * (*N)] = value;
             if ((*minInDim)[j] > value)
             {
                 (*minInDim)[j] = value;
@@ -554,7 +575,7 @@ int file_write(char *filename, int K, int N, int dim_number, float *clusters, in
     char outFileName[1024];
 
     /* output: the coordinates of the cluster centres ----------------------*/
-    sprintf(outFileName, "%s.cluster_centres", filename);
+    sprintf(outFileName, "%s.cluster_centres.txt", filename);
     printf("Writing coordinates of K=%d cluster centers to file \"%s\"\n",
            K, outFileName);
     file = fopen(outFileName, "w");
@@ -562,13 +583,13 @@ int file_write(char *filename, int K, int N, int dim_number, float *clusters, in
     {
         fprintf(file, "%d ", i);
         for (j = 0; j < dim_number; j++)
-            fprintf(file, "%f ", clusters[i * K + j]);
+            fprintf(file, "%f ", clusters[i + j * K]);
         fprintf(file, "\n");
     }
     fclose(file);
 
     /* output: the closest cluster centre to each of the data points --------*/
-    sprintf(outFileName, "%s.membership", filename);
+    sprintf(outFileName, "%s.membership.txt", filename);
     printf("Writing membership of N=%d data objects to file \"%s\"\n",
            N, outFileName);
     file = fopen(outFileName, "w");
@@ -577,16 +598,4 @@ int file_write(char *filename, int K, int N, int dim_number, float *clusters, in
     fclose(file);
 
     return 1;
-}
-
-__host__ __device__ float distance_without_sqrt(float *x, float *y, int dim_number)
-{
-    float result = 0.0;
-
-    for (int i = 0; i < dim_number; i++)
-    {
-        result += (x[i] - y[i]) * (x[i] - y[i]);
-    }
-
-    return result;
 }
