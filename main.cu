@@ -116,7 +116,7 @@ int main(int argc, char **argv)
 
     int N, dim_number;
     float *minInDim, *maxInDim;
-    float threshold = 0.001;
+    float threshold = 0.0001f;
     float *objects = file_read(filename, &N, &dim_number, &minInDim, &maxInDim);
 
     srand(10);
@@ -509,7 +509,7 @@ float *file_read(char *filename, int *N, int *dim_number, float **minInDim, floa
     int i, j, len;
 
     FILE *file;
-    char *line, *ret;
+    char *line;
     const char *delim = " \t\n\r";
     int lineLen;
 
@@ -538,8 +538,7 @@ float *file_read(char *filename, int *N, int *dim_number, float **minInDim, floa
             line = (char *)realloc(line, lineLen);
             assert(line != NULL);
 
-            ret = fgets(line, lineLen, file);
-            assert(ret != NULL);
+            fgets(line, lineLen, file);
         }
 
         if (strtok(line, delim) != 0)
@@ -581,7 +580,7 @@ float *file_read(char *filename, int *N, int *dim_number, float **minInDim, floa
             continue;
         for (j = 0; j < (*dim_number); j++)
         {
-            float value = atof(strtok(NULL, delim));
+            float value = (float)atof(strtok(NULL, delim));
             objects[i + j * (*N)] = value;
             if ((*minInDim)[j] > value)
             {
